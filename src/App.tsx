@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   auth, db, googleProvider, signInWithPopup, signOut, onAuthStateChanged, 
-  doc, getDoc, setDoc, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, 
-  Timestamp, User, OperationType, handleFirestoreError, getDocFromServer 
+  doc, getDoc, setDoc, updateDoc, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, 
+  Timestamp, User, OperationType, handleFirestoreError, getDocFromServer, arrayUnion, arrayRemove
 } from './lib/firebase';
 import { generateAnalysis, chatWithGemini, quickResponse } from './lib/gemini';
+import { extractLearnings } from './lib/memoryService';
 import { BRIEFING_DATA } from './constants/briefing';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -17,7 +18,7 @@ import { Separator } from '@/components/ui/separator';
 import { 
   Brain, MessageSquare, BookOpen, Terminal, Shield, Cpu, 
   TrendingUp, LogOut, LogIn, Send, Sparkles, Search, 
-  Layers, Database, Zap, ChevronRight, Menu, X
+  Layers, Database, Zap, ChevronRight, Menu, X, ArrowLeft, Plus, XCircle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
@@ -70,6 +71,7 @@ const Sidebar = ({ activeSection, setActiveSection, user, onLogout }: any) => {
     { id: 'dashboard', label: 'Briefing Dashboard', icon: BookOpen },
     { id: 'chat', label: 'AI Assistant', icon: MessageSquare },
     { id: 'analysis', label: 'Deep Analysis', icon: Brain },
+    { id: 'memory', label: 'Agent Memory', icon: Database },
   ];
 
   return (
@@ -180,6 +182,7 @@ const ChatAssistant = ({ user }: { user: User }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isExtracting, setIsExtracting] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -237,6 +240,34 @@ const ChatAssistant = ({ user }: { user: User }) => {
     }
   };
 
+  const handleExtractLearnings = async () => {
+    if (messages.length === 0 || isExtracting) return;
+    setIsExtracting(true);
+    toast.info("Extracting learnings from chat history...", { id: "extract-toast" });
+    try {
+      const history = messages.map(m => ({ role: m.role, content: m.content }));
+      const result = await extractLearnings(history);
+      
+      if (result.learned && result.title && result.content) {
+        await addDoc(collection(db, 'users', user.uid, 'skills'), {
+          title: result.title,
+          content: result.content,
+          tags: result.tags || [],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+        toast.success(`Skill saved: ${result.title}`, { id: "extract-toast" });
+      } else {
+        toast.error("No valuable skill found to extract.", { id: "extract-toast" });
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error("Extraction failed.", { id: "extract-toast" });
+    } finally {
+      setIsExtracting(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)] glass-panel rounded-xl overflow-hidden border-line">
       <div className="p-4 border-b border-line bg-white/5 flex items-center justify-between">
@@ -244,7 +275,18 @@ const ChatAssistant = ({ user }: { user: User }) => {
           <MessageSquare className="w-5 h-5 text-accent" />
           <h2 className="font-bold mono-text">AI LANDSCAPE ASSISTANT</h2>
         </div>
-        <Badge variant="outline" className="text-[10px] border-accent/20 text-accent/70">GEMINI-3-FLASH</Badge>
+        <div className="flex items-center gap-4">
+          <Button 
+            variant="outline" 
+            size="sm" 
+            onClick={handleExtractLearnings} 
+            disabled={isExtracting || messages.length === 0}
+            className="h-7 text-[10px] border-accent/20 hover:bg-accent/10"
+          >
+            {isExtracting ? 'EXTRACTING...' : 'SAVE LEARNINGS'}
+          </Button>
+          <Badge variant="outline" className="text-[10px] border-accent/20 text-accent/70">GEMINI-3-FLASH</Badge>
+        </div>
       </div>
 
       <ScrollArea className="flex-1 p-4" ref={scrollRef}>
@@ -384,6 +426,211 @@ const DeepAnalysis = () => {
   );
 };
 
+const MemoryDashboard = ({ user }: { user: User }) => {
+  const [skills, setSkills] = useState<any[]>([]);
+  const [selectedSkill, setSelectedSkill] = useState<any | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [showListOnMobile, setShowListOnMobile] = useState(true);
+  const [newTag, setNewTag] = useState('');
+
+  useEffect(() => {
+    if (!user) return;
+    const q = query(
+      collection(db, 'users', user.uid, 'skills'),
+      orderBy('createdAt', 'desc')
+    );
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedSkills = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setSkills(fetchedSkills);
+      if (fetchedSkills.length > 0 && !selectedSkill && window.innerWidth >= 768) {
+        setSelectedSkill(fetchedSkills[0]);
+      }
+    }, (err) => handleFirestoreError(err, OperationType.LIST, 'skills'));
+
+    return () => unsubscribe();
+  }, [user]);
+
+  const filteredSkills = skills.filter(skill => {
+    const term = searchTerm.toLowerCase();
+    const titleMatch = skill.title?.toLowerCase().includes(term);
+    const tagsMatch = skill.tags?.some((t: string) => t.toLowerCase().includes(term));
+    return titleMatch || tagsMatch;
+  });
+
+  const handleAddTag = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!newTag.trim() || !selectedSkill) return;
+    
+    if (selectedSkill.tags?.map((t: string) => t.toLowerCase()).includes(newTag.trim().toLowerCase())) {
+      setNewTag('');
+      return;
+    }
+
+    try {
+      await updateDoc(doc(db, 'users', user.uid, 'skills', selectedSkill.id), {
+        tags: arrayUnion(newTag.trim()),
+        updatedAt: serverTimestamp()
+      });
+      setNewTag('');
+    } catch (err) {
+      console.error(err);
+      toast.error('Failed to add tag');
+    }
+  };
+
+  const handleRemoveTag = async (tagToRemove: string) => {
+    if (!selectedSkill) return;
+    try {
+      await updateDoc(doc(db, 'users', user.uid, 'skills', selectedSkill.id), {
+        tags: arrayRemove(tagToRemove),
+        updatedAt: serverTimestamp()
+      });
+    } catch (err) {
+      console.error(err);
+      toast.error('Failed to remove tag');
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-8rem)] glass-panel rounded-xl overflow-hidden border-line">
+      <div className="p-4 border-b border-line bg-white/5 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          {!showListOnMobile && (
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="md:hidden h-8 w-8 mr-2 -ml-2" 
+              onClick={() => setShowListOnMobile(true)}
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </Button>
+          )}
+          <Database className="w-5 h-5 text-accent hidden md:block" />
+          <h2 className="font-bold mono-text text-sm md:text-base">AGENT MEMORY & SKILLS</h2>
+        </div>
+        <Badge variant="outline" className="text-[10px] border-accent/20 text-accent/70 hidden md:inline-flex">SDK_ENABLED</Badge>
+      </div>
+      
+      <div className="flex flex-col md:flex-row flex-1 h-full overflow-hidden">
+        {/* Sidebar List */}
+        <div className={`w-full md:w-1/3 border-r border-line bg-black/40 flex-col ${showListOnMobile ? 'flex' : 'hidden md:flex'}`}>
+          <div className="p-4 border-b border-line">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                placeholder="Search skills or tags..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="pl-9 bg-black/50 border-line text-sm text-foreground focus:border-accent"
+              />
+            </div>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto custom-scrollbar">
+            {filteredSkills.length === 0 ? (
+              <div className="text-center p-8 text-muted-foreground text-sm">
+                {skills.length === 0 ? (
+                  <>
+                    <LogOut className="w-8 h-8 opacity-20 mx-auto mb-2" />
+                    <p>No skills extracted yet.</p>
+                    <p className="text-xs opacity-50 mt-2">Use the Assistant tab and click "Save Learnings" to generate a skill.</p>
+                  </>
+                ) : (
+                  <>
+                    <Search className="w-8 h-8 opacity-20 mx-auto mb-2" />
+                    <p>No skills matched your search.</p>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="p-4 space-y-2">
+                {filteredSkills.map(skill => (
+                  <button
+                    key={skill.id}
+                    onClick={() => {
+                      setSelectedSkill(skill);
+                      setShowListOnMobile(false);
+                    }}
+                    className={`w-full text-left p-3 rounded-lg border transition-all ${
+                      selectedSkill?.id === skill.id 
+                        ? 'bg-accent/10 border-accent/30 text-white' 
+                        : 'border-transparent hover:bg-white/5 text-muted-foreground hover:text-white'
+                    }`}
+                  >
+                    <div className="font-medium text-sm truncate">{skill.title}</div>
+                    <div className="flex gap-1 mt-2 flex-wrap">
+                      {skill.tags?.map((t: string) => (
+                        <Badge key={t} variant="secondary" className="text-[9px] bg-black border-line">
+                          {t}
+                        </Badge>
+                      ))}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Content Area */}
+        <div className={`flex-1 bg-black/20 overflow-y-auto custom-scrollbar p-4 md:p-6 ${showListOnMobile ? 'hidden md:block' : 'block'}`}>
+          {selectedSkill ? (
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-xl md:text-2xl font-bold mb-2">{selectedSkill.title}</h3>
+                <div className="flex flex-wrap gap-2 text-xs text-muted-foreground mb-4 items-center">
+                  <span>ID: <code className="text-[10px] bg-white/10 px-1 py-0.5 rounded">{selectedSkill.id}</code></span>
+                  <span>•</span>
+                  <span>{selectedSkill.createdAt?.toDate ? format(selectedSkill.createdAt.toDate(), 'PPpp') : ''}</span>
+                </div>
+                
+                {/* Tag Management */}
+                <div className="mb-4 space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    {selectedSkill.tags?.map((t: string) => (
+                      <Badge key={t} className="bg-accent/10 text-accent border-accent/20 hover:bg-accent/20 flex items-center gap-1 group transition-colors">
+                        {t}
+                        <button 
+                          onClick={() => handleRemoveTag(t)}
+                          className="opacity-50 hover:opacity-100 transition-opacity"
+                        >
+                          <XCircle className="w-3 h-3" />
+                        </button>
+                      </Badge>
+                    ))}
+                  </div>
+                  <form onSubmit={handleAddTag} className="flex gap-2 max-w-sm">
+                    <Input 
+                      placeholder="Add tag..." 
+                      value={newTag}
+                      onChange={(e) => setNewTag(e.target.value)}
+                      className="h-8 text-xs bg-black/50 border-line focus:border-accent"
+                    />
+                    <Button type="submit" size="sm" variant="outline" className="h-8 px-2 border-line hover:border-accent hover:text-accent">
+                      <Plus className="w-4 h-4" />
+                    </Button>
+                  </form>
+                </div>
+                <Separator className="bg-line" />
+              </div>
+              <div className="prose prose-invert max-w-none prose-sm">
+                <div className="markdown-body">
+                  <ReactMarkdown>{selectedSkill.content}</ReactMarkdown>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="h-full flex items-center justify-center text-muted-foreground text-sm">
+              Select a skill to view its Markdown content.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Main App ---
 
 export default function App() {
@@ -484,6 +731,7 @@ export default function App() {
             {activeSection === 'dashboard' && <Dashboard />}
             {activeSection === 'chat' && <ChatAssistant user={user} />}
             {activeSection === 'analysis' && <DeepAnalysis />}
+            {activeSection === 'memory' && <MemoryDashboard user={user} />}
           </motion.div>
         </AnimatePresence>
       </main>

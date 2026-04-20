@@ -30,6 +30,15 @@ service cloud.firestore {
     //   - content: string (required)
     //   - timestamp: timestamp (required)
     //
+    // Collection: users/{uid}/skills
+    // Document ID: {skillId}
+    // Fields:
+    //   - title: string (required)
+    //   - content: string (required)
+    //   - tags: list (optional)
+    //   - createdAt: timestamp (required)
+    //   - updatedAt: timestamp (required)
+    //
     // ===============================================================
 
     // ===============================================================
@@ -68,8 +77,16 @@ service cloud.firestore {
     function isValidMessage(data) {
       return data.keys().hasAll(['role', 'content', 'timestamp']) &&
              data.role in ['user', 'model'] &&
-             data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
+             data.content is string && data.content.size() > 0 && data.content.size() < 100000 &&
              data.timestamp is timestamp;
+    }
+
+    function isValidSkill(data) {
+      return data.keys().hasAll(['title', 'content', 'createdAt', 'updatedAt']) &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
+             data.content is string && data.content.size() > 0 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
     }
 
     // ===============================================================
@@ -79,7 +96,7 @@ service cloud.firestore {
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
       allow create: if isOwner(uid) && isValidUser(request.resource.data) && (request.resource.data.role == 'user' || isAdmin());
-      allow update: if isOwner(uid) && isValidUser(request.resource.data) && (request.resource.data.role == resource.data.role || isAdmin());
+      allow update: if isOwner(uid) && (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'photoURL', 'displayName'])) && (isOwner(uid) || isAdmin());
       
       match /chats/{chatId} {
         allow read: if isOwner(uid) || isAdmin();
@@ -91,6 +108,13 @@ service cloud.firestore {
           allow read: if isOwner(uid) || isAdmin();
           allow create: if isOwner(uid) && isValidMessage(request.resource.data);
         }
+      }
+
+      match /skills/{skillId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow create: if isOwner(uid) && isValidSkill(request.resource.data);
+        allow update: if isOwner(uid) && isValidSkill(request.resource.data);
+        allow delete: if isOwner(uid);
       }
     }
 
